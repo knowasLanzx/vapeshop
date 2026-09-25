@@ -7,11 +7,13 @@ const isOwner = computed(() => $auth?.profile.value?.role === 'owner')
 
 const summary = ref([])
 const transactions = ref([])
+const replacementTransactions = ref([])
 const products = ref([])
 const cart = ref([])
 const search = ref('')
 const confirmMessage = ref('')
 const successMessage = ref('')
+const paymentMethod = ref('')
 const isSaving = ref(false)
 const showConfirm = ref(false)
 const trendRange = ref('day')
@@ -20,6 +22,16 @@ const selectedDate = ref(currentDate.toISOString().slice(0, 10))
 const selectedMonth = ref(`${currentDate.getFullYear()}-${String(currentDate.getMonth() + 1).padStart(2, '0')}`)
 const selectedYear = ref(String(currentDate.getFullYear()))
 const selectedEmployee = ref('')
+const shopDateFormatter = new Intl.DateTimeFormat('en-CA', {
+  timeZone: 'Asia/Manila',
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit',
+})
+const getShopDate = (value) => shopDateFormatter.format(new Date(value))
+const soldHistoryDate = ref(getShopDate(new Date()))
+const replacementHistoryDate = ref(getShopDate(new Date()))
+const expandedReplacementSaleId = ref(null)
 const selectedTrendPoint = ref(null)
 let salesChannel
 let successTimeout
@@ -67,6 +79,29 @@ const parseDateInput = (value) => {
 const parseMonthInput = (value) => {
   const [year, month] = value.split('-').map(Number)
   return new Date(year, month - 1, 1)
+}
+
+const isInSelectedPeriod = (createdAt) => {
+  const date = new Date(createdAt)
+
+  if (trendRange.value === 'day') {
+    return date.toDateString() === parseDateInput(selectedDate.value).toDateString()
+  }
+
+  if (trendRange.value === 'week') {
+    const weekStart = parseDateInput(selectedDate.value)
+    weekStart.setDate(weekStart.getDate() - weekStart.getDay())
+    const weekEnd = new Date(weekStart)
+    weekEnd.setDate(weekStart.getDate() + 6)
+    return date >= new Date(weekStart.setHours(0, 0, 0, 0)) && date <= new Date(weekEnd.setHours(23, 59, 59, 999))
+  }
+
+  if (trendRange.value === 'month') {
+    const month = parseMonthInput(selectedMonth.value)
+    return date.getFullYear() === month.getFullYear() && date.getMonth() === month.getMonth()
+  }
+
+  return date.getFullYear() === Number(selectedYear.value)
 }
 
 const trendBuckets = computed(() => {
@@ -177,16 +212,30 @@ const trendSelectionLabel = computed(() => {
 })
 const trackedSales = computed(() => trendBuckets.value.flatMap((bucket) => bucket.sales))
 const trackedRevenue = computed(() => trackedSales.value.reduce((sum, sale) => sum + Number(sale.total_amount || 0), 0))
+const trackedReplacements = computed(() => replacementTransactions.value.filter((item) => {
+  return isInSelectedPeriod(item.created_at) && (!selectedEmployee.value || (item.employee_name || 'Employee') === selectedEmployee.value)
+}))
 const trackedSummary = computed(() => [
   { label: 'Total Sales', value: formatPeso(trackedRevenue.value) },
   { label: 'Transactions', value: String(trackedSales.value.length) },
   { label: 'Items Sold', value: String(trackedSales.value.reduce((sum, sale) => sum + Number(sale.quantity || 0), 0)) },
+  { label: 'Items Replaced', value: String(trackedReplacements.value.reduce((sum, item) => sum + Number(item.quantity || 0), 0)) },
   { label: 'Avg. Ticket', value: formatPeso(trackedSales.value.length ? trackedRevenue.value / trackedSales.value.length : 0) },
 ])
 const filteredTransactions = computed(() => {
-  if (!selectedEmployee.value) return transactions.value
-  return transactions.value.filter((sale) => (sale.employee_name || 'Employee') === selectedEmployee.value)
+  return transactions.value.filter((sale) => {
+    return sale.sale_type !== 'replacement_charge' &&
+      getShopDate(sale.created_at) === soldHistoryDate.value &&
+      (!selectedEmployee.value || (sale.employee_name || 'Employee') === selectedEmployee.value)
+  })
 })
+const filteredReplacementTransactions = computed(() => replacementTransactions.value.filter((item) => {
+  return getShopDate(item.created_at) === replacementHistoryDate.value
+}))
+const replacementsForSale = (saleId) => replacementTransactions.value.filter((item) => Number(item.sale_id) === Number(saleId))
+const toggleReplacementDetails = (saleId) => {
+  expandedReplacementSaleId.value = expandedReplacementSaleId.value === saleId ? null : saleId
+}
 const selectTrendPoint = (point) => {
   selectedTrendPoint.value = point
 }
@@ -202,6 +251,13 @@ const fetchSales = async () => {
     .from('sales')
     .select('*')
     .order('created_at', { ascending: false })
+
+  const { data: replacements } = await supabase.value
+    .from('inventory_adjustments')
+    .select('id, sale_id, product_name, quantity, reason, employee_name, payment_method, original_product_name, original_unit_price, replacement_unit_price, additional_amount, created_at')
+    .order('created_at', { ascending: false })
+
+  replacementTransactions.value = replacements || []
 
   if (!error && data) {
     transactions.value = data
@@ -247,6 +303,8 @@ const filteredProducts = computed(() => {
 })
 
 const addToCart = (product) => {
+  if (Number(product.stock) <= 0) return
+
   const existing = cart.value.find((item) => item.id === product.id)
   if (existing) {
     if (existing.qty >= product.stock) return
@@ -283,6 +341,10 @@ const adjustQty = (id, nextQty) => {
 
 const completeSale = async () => {
   if (!supabase.value || !cart.value.length || isSaving.value) return
+  if (!['cash', 'gcash'].includes(paymentMethod.value)) {
+    confirmMessage.value = 'Select Cash or GCash before completing the sale.'
+    return
+  }
 
   isSaving.value = true
   confirmMessage.value = ''
@@ -325,6 +387,7 @@ const completeSale = async () => {
       total_amount: Number(item.price * item.qty),
       employee_name: employeeName,
       employee_id: employeeId,
+      payment_method: paymentMethod.value,
       created_at: new Date().toISOString(),
     }))
 
@@ -336,6 +399,7 @@ const completeSale = async () => {
     }
 
     cart.value = []
+    paymentMethod.value = ''
     confirmMessage.value = ''
     showConfirm.value = false
     successMessage.value = 'Sale completed successfully.'
@@ -472,13 +536,20 @@ onUnmounted(() => {
     <section class="panel sales-panel">
       <div class="panel-header">
         <h3>Sold products</h3>
-        <label class="employee-filter">
-          Employee
-          <select v-model="selectedEmployee">
-            <option value="">All employees</option>
-            <option v-for="employee in employeeOptions" :key="employee" :value="employee">{{ employee }}</option>
-          </select>
-        </label>
+        <div class="history-filters">
+          <label class="history-date-filter">
+            Date
+            <input v-model="soldHistoryDate" type="date" />
+          </label>
+          <button class="today-btn" type="button" @click="soldHistoryDate = getShopDate(new Date())">Today</button>
+          <label class="employee-filter">
+            Employee
+            <select v-model="selectedEmployee">
+              <option value="">All employees</option>
+              <option v-for="employee in employeeOptions" :key="employee" :value="employee">{{ employee }}</option>
+            </select>
+          </label>
+        </div>
       </div>
 
       <table>
@@ -488,7 +559,9 @@ onUnmounted(() => {
             <th>Flavor</th>
             <th>Qty</th>
             <th>Employee</th>
+            <th>Payment</th>
             <th>Total</th>
+            <th>Replacement</th>
             <th>Time</th>
           </tr>
         </thead>
@@ -498,11 +571,80 @@ onUnmounted(() => {
             <td>{{ entry.flavor || '—' }}</td>
             <td>{{ entry.quantity }}</td>
             <td>{{ entry.employee_name || 'Employee' }}</td>
+            <td>{{ entry.payment_method === 'gcash' ? 'GCash' : entry.payment_method === 'cash' ? 'Cash' : '—' }}</td>
             <td>{{ formatPeso(entry.total_amount) }}</td>
+            <td>
+              <button
+                v-if="replacementsForSale(entry.id).length"
+                class="replacement-mark"
+                type="button"
+                :aria-expanded="expandedReplacementSaleId === entry.id"
+                @click="toggleReplacementDetails(entry.id)"
+              >
+                {{ expandedReplacementSaleId === entry.id ? 'Hide' : 'Replaced' }} · {{ replacementsForSale(entry.id).reduce((sum, replacement) => sum + Number(replacement.quantity || 0), 0) }}
+              </button>
+              <span v-else>—</span>
+              <div v-if="expandedReplacementSaleId === entry.id" class="replacement-details">
+                <div v-for="replacement in replacementsForSale(entry.id)" :key="replacement.id" class="replacement-detail">
+                  <strong>{{ replacement.original_product_name || entry.product_name }} → {{ replacement.product_name }}</strong>
+                  <span>{{ replacement.quantity }} replaced · {{ replacement.reason }}</span>
+                  <span>{{ formatPeso(replacement.original_unit_price) }} → {{ formatPeso(replacement.replacement_unit_price) }}</span>
+                  <span>Additional: {{ formatPeso(replacement.additional_amount) }}</span>
+                </div>
+              </div>
+            </td>
             <td>{{ new Date(entry.created_at).toLocaleString() }}</td>
           </tr>
         </tbody>
       </table>
+      <p v-if="!filteredTransactions.length" class="empty-state">No sales for this date.</p>
+    </section>
+
+    <section class="panel sales-panel replacement-history-panel">
+      <div class="panel-header">
+        <h3>Replacement history</h3>
+        <div class="history-filters">
+          <label class="history-date-filter">
+            Date
+            <input v-model="replacementHistoryDate" type="date" />
+          </label>
+          <button class="today-btn" type="button" @click="replacementHistoryDate = getShopDate(new Date())">Today</button>
+        </div>
+      </div>
+
+      <div class="replacement-table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Item sold</th>
+              <th>Sold price</th>
+              <th>Replacement product</th>
+              <th>Qty</th>
+              <th>Replacement price</th>
+              <th>Additional</th>
+              <th>Reason</th>
+              <th>Employee</th>
+              <th>Mode of payment</th>
+              <th>Time</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="entry in filteredReplacementTransactions" :key="entry.id">
+              <td>{{ entry.original_product_name || '—' }}</td>
+              <td>{{ formatPeso(entry.original_unit_price) }}</td>
+              <td>{{ entry.product_name }}</td>
+              <td>{{ entry.quantity }}</td>
+              <td>{{ formatPeso(entry.replacement_unit_price) }}</td>
+              <td>{{ formatPeso(entry.additional_amount) }}</td>
+              <td>{{ entry.reason }}</td>
+              <td>{{ entry.employee_name || 'Employee' }}</td>
+              <td>{{ entry.payment_method === 'gcash' ? 'GCash' : entry.payment_method === 'cash' ? 'Cash' : Number(entry.additional_amount) > 0 ? 'Not recorded' : 'No add-on' }}</td>
+              <td class="replacement-time">{{ new Date(entry.created_at).toLocaleString('en-PH', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) }}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p v-if="!filteredReplacementTransactions.length" class="empty-state">No replacement records for this date.</p>
     </section>
   </div>
 
@@ -513,7 +655,10 @@ onUnmounted(() => {
         <p class="eyebrow">Employee</p>
         <h1>New sale</h1>
       </div>
-      <button class="primary-btn" type="button" @click="showConfirm = true" :disabled="!cart.length || isSaving">Complete sale</button>
+      <div class="employee-actions">
+        <NuxtLink to="/replacement" class="secondary-btn">Replacement</NuxtLink>
+        <button class="primary-btn" type="button" @click="showConfirm = true" :disabled="!cart.length || isSaving">Complete sale</button>
+      </div>
     </header>
 
     <section class="sale-layout">
@@ -527,7 +672,7 @@ onUnmounted(() => {
         </div>
 
         <div class="product-list">
-          <button v-for="product in filteredProducts" :key="product.id" type="button" class="product-item" @click="addToCart(product)">
+          <button v-for="product in filteredProducts" :key="product.id" type="button" class="product-item" :class="{ 'product-item-sold-out': product.stock <= 0 }" :disabled="product.stock <= 0" @click="addToCart(product)">
             <div class="thumb" v-if="product.image">
               <img :src="product.image" :alt="product.name" />
             </div>
@@ -536,7 +681,7 @@ onUnmounted(() => {
             <div class="product-copy">
               <div class="product-line">
                 <h3>{{ product.name }}</h3>
-                <span class="stock-pill">{{ product.stock }} left</span>
+                <span class="stock-pill" :class="{ 'stock-pill-sold-out': product.stock <= 0 }">{{ product.stock <= 0 ? 'Sold out' : `${product.stock} left` }}</span>
               </div>
               <p>{{ product.flavor || 'No flavor' }} · {{ product.category }}</p>
               <strong>{{ formatPeso(product.price) }}</strong>
@@ -611,9 +756,18 @@ onUnmounted(() => {
           <strong>{{ formatPeso(subtotal) }}</strong>
         </div>
 
+        <label class="payment-method-field">
+          Mode of payment
+          <select v-model="paymentMethod" required>
+            <option value="">Select payment method</option>
+            <option value="cash">Cash</option>
+            <option value="gcash">GCash</option>
+          </select>
+        </label>
+
         <div class="confirm-actions">
           <button class="secondary-btn" type="button" @click="showConfirm = false">Go back</button>
-          <button class="primary-btn" type="button" @click="completeSale" :disabled="isSaving">
+          <button class="primary-btn" type="button" @click="completeSale" :disabled="isSaving || !paymentMethod">
             {{ isSaving ? 'Saving...' : 'Confirm sold' }}
           </button>
         </div>
@@ -676,6 +830,12 @@ p {
 .primary-btn:disabled {
   opacity: 0.55;
   cursor: not-allowed;
+}
+
+.employee-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .stats-grid {
@@ -873,6 +1033,52 @@ p {
   margin-top: 18px;
 }
 
+.replacement-table-wrap {
+  max-width: 100%;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+}
+
+.replacement-table-wrap table {
+  min-width: 980px;
+}
+
+.replacement-time {
+  white-space: nowrap;
+}
+
+.replacement-mark {
+  border: 0;
+  border-radius: 999px;
+  padding: 6px 9px;
+  background: #fff1d6;
+  color: #815200;
+  cursor: pointer;
+  font: inherit;
+  font-size: 11px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.replacement-details {
+  display: grid;
+  min-width: 220px;
+  gap: 8px;
+  margin-top: 8px;
+  white-space: normal;
+}
+
+.replacement-detail {
+  display: grid;
+  gap: 3px;
+  color: #666666;
+  font-size: 11px;
+}
+
+.replacement-detail strong {
+  color: #111111;
+}
+
 .employee-filter {
   display: inline-flex;
   align-items: center;
@@ -889,6 +1095,43 @@ p {
   padding: 8px 10px;
   background: #fafafa;
   color: #111111;
+}
+
+.history-filters {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.history-date-filter {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: #666666;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.history-date-filter input {
+  border: 1px solid rgba(17, 17, 17, 0.1);
+  border-radius: 9px;
+  padding: 8px 10px;
+  background: #fafafa;
+  color: #111111;
+  font: inherit;
+}
+
+.today-btn {
+  border: 1px solid rgba(17, 17, 17, 0.1);
+  border-radius: 9px;
+  padding: 8px 10px;
+  background: #ffffff;
+  color: #111111;
+  cursor: pointer;
+  font: inherit;
+  font-weight: 600;
 }
 
 th,
@@ -937,6 +1180,14 @@ th {
   cursor: pointer;
 }
 
+.product-item:disabled {
+  cursor: not-allowed;
+}
+
+.product-item-sold-out {
+  opacity: 0.58;
+}
+
 .thumb {
   width: 58px;
   height: 58px;
@@ -982,6 +1233,11 @@ th {
   padding: 6px 9px;
   font-size: 11px;
   font-weight: 700;
+}
+
+.stock-pill-sold-out {
+  background: #fee2e2;
+  color: #991b1b;
 }
 
 .empty-state {
@@ -1107,6 +1363,25 @@ th {
   gap: 12px;
 }
 
+.payment-method-field {
+  display: grid;
+  gap: 7px;
+  margin-top: 16px;
+  color: #333333;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.payment-method-field select {
+  width: 100%;
+  border: 1px solid rgba(17, 17, 17, 0.12);
+  border-radius: 9px;
+  padding: 11px 12px;
+  background: #fafafa;
+  color: #111111;
+  font: inherit;
+}
+
 .confirm-item {
   padding: 10px 12px;
   border-radius: 10px;
@@ -1171,6 +1446,11 @@ th {
   .employee-filter {
     width: 100%;
     justify-content: space-between;
+  }
+
+  .history-filters {
+    width: 100%;
+    justify-content: flex-start;
   }
 
   .trend-tabs {

@@ -34,8 +34,20 @@ const getStatus = (stock) => {
 
 const metricPath = (label) => {
   if (label === "Today's Revenue") return '/sales'
+  if (label === 'Replacements Today') return '/sales'
   if (label === 'Products') return '/products'
   return '/inventory'
+}
+
+const isTodayInShopTimezone = (dateValue) => {
+  const formatDate = (date) => new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Manila',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).format(date)
+
+  return formatDate(new Date(dateValue)) === formatDate(new Date())
 }
 
 const trendSettings = {
@@ -119,15 +131,17 @@ const trendPeriodLabel = computed(() => trendSettings[trendRange.value].label)
 const fetchDashboardData = async () => {
   if (!supabase.value) return
 
-  const [productsResult, salesResult, profilesResult] = await Promise.all([
+  const [productsResult, salesResult, profilesResult, replacementsResult] = await Promise.all([
     supabase.value.from('products').select('*').order('created_at', { ascending: false }),
     supabase.value.from('sales').select('*').order('created_at', { ascending: false }),
     supabase.value.from('profiles').select('display_name, role').order('created_at', { ascending: false }),
+    supabase.value.from('inventory_adjustments').select('quantity, created_at'),
   ])
 
   const productRows = productsResult.data || []
   const saleRows = salesResult.data || []
   const profileRows = profilesResult.data || []
+  const replacementRows = replacementsResult.data || []
 
   products.value = productRows.map((product) => {
     const stock = Number(product.stock) || 0
@@ -172,21 +186,19 @@ const fetchDashboardData = async () => {
     status: 'Active',
   }))
 
-  const today = new Date()
-  const totalRevenue = saleRows
-    .filter((sale) => {
-      const saleDate = new Date(sale.created_at)
-      return saleDate.getFullYear() === today.getFullYear()
-        && saleDate.getMonth() === today.getMonth()
-        && saleDate.getDate() === today.getDate()
-    })
+  const todaysSales = saleRows.filter((sale) => isTodayInShopTimezone(sale.created_at))
+  const totalRevenue = todaysSales
     .reduce((sum, sale) => sum + Number(sale.total_amount || 0), 0)
+  const replacementUnitsToday = replacementRows
+    .filter((replacement) => isTodayInShopTimezone(replacement.created_at))
+    .reduce((sum, replacement) => sum + Number(replacement.quantity || 0), 0)
   const totalProducts = productRows.length
   const lowStockCount = productRows.filter((product) => Number(product.stock) <= 10).length
   const totalStock = productRows.reduce((sum, product) => sum + Number(product.stock || 0), 0)
 
   metrics.value = [
     { label: "Today's Revenue", value: formatPeso(totalRevenue), delta: 'Live', tone: 'dark' },
+    { label: 'Replacements Today', value: String(replacementUnitsToday), delta: 'Today', tone: 'dark' },
     { label: 'Products', value: String(totalProducts), delta: 'Stock', tone: 'dark' },
     { label: 'Low Stock', value: String(lowStockCount), delta: 'Alert', tone: 'dark' },
     { label: 'Units', value: String(totalStock), delta: 'In hand', tone: 'dark' },
@@ -200,6 +212,7 @@ onMounted(async () => {
     salesChannel = supabase.value
       .channel('dashboard-sales')
       .on('postgres_changes', { event: '*', schema: 'public', table: 'sales' }, fetchDashboardData)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'inventory_adjustments' }, fetchDashboardData)
       .subscribe()
   }
 })

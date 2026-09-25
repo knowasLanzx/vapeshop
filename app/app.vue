@@ -7,6 +7,7 @@ const navItems = [
   { label: 'Products', path: '/products' },
   { label: 'Sales', path: '/sales' },
   { label: 'My Sale', path: '/my-sales' },
+  { label: 'Replacement', path: '/replacement' },
   { label: 'Inventory', path: '/inventory' },
   { label: 'Staff', path: '/staff' },
 ]
@@ -17,10 +18,10 @@ const visibleNavItems = computed(() => {
   const role = $auth?.profile.value?.role
 
   if (role === 'owner') {
-    return navItems.filter((item) => item.path !== '/my-sales')
+    return navItems.filter((item) => !['/my-sales', '/replacement'].includes(item.path))
   }
 
-  return navItems.filter((item) => ['/sales', '/my-sales'].includes(item.path))
+  return navItems.filter((item) => ['/sales', '/my-sales', '/replacement'].includes(item.path))
 })
 
 const signOut = async () => {

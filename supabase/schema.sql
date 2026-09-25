@@ -33,6 +33,8 @@ create table if not exists public.sales (
   category text,
   quantity integer not null default 1,
   total_amount numeric(12,2) not null default 0,
+  sale_type text not null default 'sale' check (sale_type in ('sale', 'replacement_charge')),
+  payment_method text check (payment_method in ('cash', 'gcash')),
   employee_id uuid references auth.users(id) on delete set null,
   employee_name text,
   created_at timestamptz not null default now()
